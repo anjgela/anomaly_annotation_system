@@ -1,5 +1,5 @@
 # SEMI-AUTOMATIC ANOMALY ANNOTATION SYSTEM IN THERMAL VIDEOS
-This is an interactive application provided with a web UI via the Streamlit framework, developed as a Bachelor's degree reaserch thesis.
+This is an interactive application provided with a web UI via the Streamlit framework, developed as a Computer Engineering Bachelor's degree reaserch thesis.
 
 ## Installation and Execution
 
