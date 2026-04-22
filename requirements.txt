@@ -1,0 +1,11 @@
+supervision==0.21.0
+transformers==4.39.3
+blinker
+streamlit
+streamlit-image-coordinates
+ultralytics
+opencv-python
+scipy
+pandas
+matplotlib
+configparser
