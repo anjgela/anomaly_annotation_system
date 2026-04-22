@@ -31,7 +31,7 @@ Both methods require an NVIDIA GPU (optimised for RTX 4000/Blackwell series via 
 	
 	conda activate anomaly_env
 	
-	cp .env.example .env
+	cp config.txt .env
 
 4. System setup:
 	
