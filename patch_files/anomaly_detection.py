@@ -1,0 +1,608 @@
+from groundingdino.util.inference import load_model
+import os
+import torch
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import gc
+import time
+from sam2.build_sam import build_sam2_video_predictor
+
+import utility
+from gpu_utility import set_device
+from utility import is_mask_duplicate
+
+
+def read_config(config_path):
+    import configparser
+
+    # Set default values
+    config = {
+        'sam2_checkpoint': "./models/sam2.1/sam2.1_hiera_tiny.pt",
+        'sam2_cfg_path': "./configs/sam2.1/sam2.1_hiera_t.yaml",
+        'groundingdino_checkpoint': "./models/grounding_dino/groundingdino_swint_ogc.pth",
+        'groundingdino_cfg_path': "./configs/grounding_dino/GroundingDINO_SwinT_OGC.py"
+    }
+
+    # Check if config file exists
+    if not os.path.exists(config_path):
+        print(f"Warning: Config file {config_path} not found. Using default values.")
+        return config
+
+    # Read config file
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(config_path)
+
+        # Update config with values from file
+        if 'MODEL_PATHS' in parser:
+            for key in config:
+                if key in parser['MODEL_PATHS']:
+                    config[key] = parser['MODEL_PATHS'][key]
+
+        print(f"Config loaded from {config_path}")
+
+    except Exception as e:
+        print(f"Error reading config file: {e}")
+        print("Using default values.")
+
+    return config
+
+
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="Video anomaly detection using SAM2 and GroundingDINO")
+
+    # Config file
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="./config.ini",
+        help="Path to configuration file with model paths (default: ./config.ini)"
+    )
+
+    # Required arguments
+    parser.add_argument(
+        "--input_video",
+        type=str,
+        required=True,
+        default="./test_video/test_video_san_donato.mp4",
+        help="Path to input video file"
+    )
+
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default="./test_video/output",
+        help="Path to save output frames (default: ./test_video/output)"
+    )
+
+    # Model parameters
+    parser.add_argument(
+        "--box_threshold",
+        type=float,
+        default=0.22,
+        help="Box threshold for GroundingDINO (default: 0.22)"
+    )
+
+    parser.add_argument(
+        "--text_threshold",
+        type=float,
+        default=0.18,
+        help="Text threshold for GroundingDINO (default: 0.18)"
+    )
+
+    # save frames ?
+    parser.add_argument(
+        "--save_frames",
+        action="store_true",
+        default=False,
+        help="Save frames with detected objects (default: False)"
+    )
+
+    # show frames ?
+    parser.add_argument(
+        "--show_frames",
+        action="store_true",
+        default=True,
+        help="Show frames with detected objects (default: False)"
+    )
+
+    # add ground thruth path
+    parser.add_argument(
+        "--ground_truth_path",
+        type=str,
+        default="./test_video/ground_truth.txt",
+        help="Path to ground truth files (three directories: main_railway, safe_obstacles,dangerous_obstacles)"
+    )
+
+    # abilitate accuracy testing
+    parser.add_argument(
+        "--accuracy_test",
+        action="store_true",
+        default=False,
+        help="Test accuracy of the model (default: False)"
+    )
+
+    # Additional options
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="count",
+        default=0,
+        help="Increase verbosity (can be used multiple times, e.g., -vvv)"
+    )
+
+    return parser.parse_args()
+
+# main
+def main():
+    torch.set_grad_enabled(False) #CHANGE 
+    print("STARTING SCRIPT", flush=True) #CHANGE FOR DEBUGGING
+    # Parse command line arguments
+    args = parse_args()
+
+    # Read config file
+    config = read_config(args.config)
+
+    # Set the device
+    device = set_device()
+    print(f"using device: {device}")
+
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_path, exist_ok=True)
+
+    # Load the SAM2 model
+    sam2_checkpoint = config['sam2_checkpoint']
+    sam2_cfg_path = config['sam2_cfg_path']
+
+    print("LOADING SAM2...", flush=True) #CHANGE FOR DEBUG
+    video_predictor = build_sam2_video_predictor(sam2_cfg_path, sam2_checkpoint, device=device)
+
+    # Load the GroundingDINO model
+    groundingdino_checkpoint = config['groundingdino_checkpoint']
+    groundingdino_cfg_path = config['groundingdino_cfg_path']
+
+    print("LOADING GROUNDING DINO...", flush=True) #CHANGE FOR DEBUG
+    groundingdino = load_model(groundingdino_cfg_path, groundingdino_checkpoint, device=device)
+    BOX_TRESHOLD = args.box_threshold
+    TEXT_TRESHOLD = args.text_threshold
+
+    RAILWAY_PROMPT = "straight lines. parallel lines. track." #CHANGE FROM "one train track."
+    OBSTACLE_PROMPT = ["bright object.", "white silhoutte.", "hot spot.", "person.", "animal."] #CHANGE FROM ["all objects.","all humans.","all animals."]
+    GROUND_PROMPT = "dark background. flat surface." #CHANGE FROM all railways. ground."
+    BOX_TRESHOLD_RAILS = 0.25
+    TEXT_TRESHOLD_RAILS = 0.15
+    BOX_TRESHOLD_OBSTACLES = 0.30 #CHANGE FROM 0.80
+    TEXT_TRESHOLD_OBSTACLES = 0.25 #CHANGE FROM 0.50
+    BOX_TRESHOLD_GROUND = 0.30
+    TEXT_TRESHOLD_GROUND = 0.30
+
+    print(f"Loaded SAM2 model from {sam2_checkpoint}")
+    print(f"Loaded GroundingDINO model from {groundingdino_checkpoint}")
+    print(f'Using box threshold: {BOX_TRESHOLD}, text threshold: {TEXT_TRESHOLD}')
+    print(f'Input video: {args.input_video}')
+    print(f'Output path: {args.output_path}')
+
+    # Create a temporary directory for frame storage
+    temp_dir = os.path.join("temp_frames")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    temp_main_railway_dir = os.path.join("temp_main_railway")
+    temp_safe_obstacles_dir = os.path.join("temp_safe_obstacles")
+    temp_dangerous_obstacles_dir = os.path.join("temp_dangerous_obstacles")
+
+    # Open the video stream
+    cap = cv2.VideoCapture(args.input_video)
+    if not cap.isOpened():
+        raise Exception(f"Could not open video stream: {args.input_video}")
+
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) #CHANGE
+    print(f"TOTAL_FRAMES:{total_frames}", flush=True) #CHANGE
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Video stream at {fps} FPS, resolution: {width}x{height}")
+
+    # Object tracking variables
+    ann_id = 0
+    last_masks_rails = {}  # Store the last known mask for each object
+    frame_idx = 0
+    main_railway_box = None
+    ground_box = None
+    #anomaly tracking
+    suspect_frames = [] #CHANGE
+    selected_anomalies = False #CHANGE
+
+    try:
+        while True:
+            print(f"PROGRESS:{frame_idx}", flush=True) #CHANGE FROM print(f"\n--- Processing frame {frame_idx} ---")
+            start_time = time.time()
+
+            # Read the next frame
+            success, frame = cap.read()
+            if not success:
+                print("End of stream or error reading frame")
+                break
+
+            # Clear temp directory
+            for file in os.listdir(temp_dir):
+                os.remove(os.path.join(temp_dir, file))
+
+            # Save current frame to temp directory
+            frame_path = os.path.join(temp_dir, "000000.jpg")
+            cv2.imwrite(frame_path, frame)
+
+            # Convert to RGB for visualization
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Initialize new state for this frame
+            torch.cuda.empty_cache()
+            gc.collect()
+            inference_state_rails = video_predictor.init_state(video_path=temp_dir)
+
+            # Process based on frame index
+            if frame_idx == 0:
+                #DETECTION OF THE GROUND
+                dino_boxes, phrases, dino_scores = utility.grounding_Dino_analyzer(
+                    frame_path, groundingdino, GROUND_PROMPT, device, BOX_TRESHOLD=BOX_TRESHOLD_GROUND,
+                    TEXT_TRESHOLD=TEXT_TRESHOLD_GROUND, show=False,
+                )
+                #Selection of the box of the ground with maximum confidence
+                max_score_railway = 0
+                for i, box in enumerate(dino_boxes):
+                    if dino_scores[i] > max_score_railway:
+                        ground_box = [float(x) for x in box] #CHANGE FROM ground_box = box
+                        max_score_railway = dino_scores[i]
+
+                #DETECTION OF THE MAIN RAILWAY AND THE OBSTACLES
+                dino_boxes, phrases, dino_scores = utility.grounding_Dino_analyzer(
+                    frame_path, groundingdino, RAILWAY_PROMPT, device, BOX_TRESHOLD=BOX_TRESHOLD_RAILS,
+                    TEXT_TRESHOLD=TEXT_TRESHOLD_RAILS, show=False,
+                )
+                #Selection of the bounding box of the rails that better fits the expeted location and size
+                max_score_railway = 0
+                for i,box in enumerate(dino_boxes):
+                    if main_railway_box is None:
+                        main_railway_box = [float(x) for x in box] #CHANGE FROM main_railway_box = box
+                        max_score_railway = dino_scores[i]
+                    else:
+                        dino_box_width = box[2] - box[0]
+                        dino_box_center = (box[0] + box[2]) // 2
+                        image_center = width // 2
+                        dino_abs_distance_from_center = abs(dino_box_center - image_center)
+                        if dino_box_width >= int(0.5*width):
+                            if dino_abs_distance_from_center < int(0.25*width):
+                                if dino_scores[i] > max_score_railway:
+                                    main_railway_box = [float(x) for x in box] #CHANGE FROM main_railway_box = box
+                                    max_score_railway = dino_scores[i]
+                all_obstacles_points = []
+                #MULTIPLE OBSTACLES DETECTION
+                for class_name in OBSTACLE_PROMPT:
+                    dino_boxes, phrases, dino_scores = utility.grounding_Dino_analyzer(
+                        frame_path, groundingdino, class_name, device, BOX_TRESHOLD=BOX_TRESHOLD_OBSTACLES,
+                        TEXT_TRESHOLD=TEXT_TRESHOLD_OBSTACLES, show=False,
+                    )  # TODO Rimuovere lo show=true
+
+                    for i, box in enumerate(dino_boxes):
+                        x_min, y_min, x_max, y_max = box
+                        x_center = (x_min + x_max) // 2
+                        y_center = (y_min + y_max) // 2
+                        if (x_center, y_center) not in all_obstacles_points:
+                            all_obstacles_points.append([x_center, y_center])
+
+                print(f"Found ground: {ground_box is not None}, Found main railway: {main_railway_box is not None}, all obstacles: {len(all_obstacles_points)}")
+
+
+                ann_id += 1
+                # Add railway to tracking
+                if main_railway_box is not None:
+                    points, labels = utility.extract_main_internal_railway_points_and_labels(frame_rgb, main_railway_box,last_masks_rails)
+
+                    _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+                        inference_state=inference_state_rails,
+                        frame_idx=0,
+                        obj_id=ann_id,
+                        points=points,
+                        labels=labels,
+                        box=main_railway_box,
+                    )
+
+                    # Store railway mask
+                    last_masks_rails[ann_id] = utility.refine_mask((out_mask_logits[0] > 0).cpu().numpy())
+
+                # Add detected objects to tracking
+                for obj_point in all_obstacles_points:
+                    #IF GROUND WAS NOT RECOGNISED, ASSUME TRACK IN THE TWO LOWER THIRDS OF THE IMAGE
+                    safe_ground_box = ground_box if ground_box is not None else [0, height // 3, width, height] #CHANGE
+                    if utility.is_point_inside_box(obj_point, safe_ground_box): #CHANGE FROM ground_box
+                        ann_id += 1
+                        _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+                            inference_state=inference_state_rails,
+                            frame_idx=0,
+                            obj_id=ann_id,
+                            points=[obj_point],
+                            labels=np.array([1], np.int32),
+                        )
+
+                        # Store object mask
+                        idx = list(out_obj_ids).index(ann_id) if ann_id in out_obj_ids else 0
+                        temp_mask = (out_mask_logits[idx] > 0).cpu().numpy()
+                        if utility.is_mask_an_obstacle(temp_mask, last_masks_rails[1],ground_box) and (not is_mask_duplicate(temp_mask, idx, last_masks_rails)):
+                            last_masks_rails[ann_id] = temp_mask
+                        else:
+                            video_predictor.remove_object(inference_state_rails, ann_id)
+
+            else:
+
+                #For non-first frames, transfer objects from previous frame
+                for obj_id, mask in list(last_masks_rails.items()): #CHANGE FROM for obj_id, mask in last_masks_rails.items():
+                    # Convert mask to proper format and find center point
+                    mask_array = np.asarray(mask)
+                    if mask_array.ndim > 2:
+                        mask_array = mask_array.squeeze()
+                        if mask_array.ndim > 2:
+                            mask_array = mask_array[0]
+
+                    # Find non-zero coordinates (points inside the mask)
+                    y_indices, x_indices = np.where(mask_array > 0)
+
+                    if len(y_indices) > 0:
+                        # Use center of mass as representative point
+                        center_y = int(np.mean(y_indices))
+                        center_x = int(np.mean(x_indices))
+                        # Add object using its center point
+                        # Special handling for railway (can use box instead of point)
+                        if obj_id == 1 and main_railway_box is not None:
+                            points, labels = utility.extract_main_internal_railway_points_and_labels(frame_rgb,main_railway_box,last_masks_rails)
+                            _, _, _ = video_predictor.add_new_points_or_box(
+                                inference_state=inference_state_rails,
+                                frame_idx=0,
+                                obj_id=obj_id,
+                                points=points,
+                                labels=labels,
+
+                            )
+                        else:
+                            _, _, _ = video_predictor.add_new_points_or_box(
+                                inference_state=inference_state_rails,
+                                frame_idx=0,
+                                obj_id=obj_id,
+                                points=[[center_x, center_y]],
+                                labels=np.array([1], np.int32),
+                            )
+
+            # Propagate all objects in current frame
+            result_rails = next(video_predictor.propagate_in_video(
+                inference_state_rails,
+                start_frame_idx=0
+            ))
+            _, out_obj_ids, out_mask_logits = result_rails
+
+
+            # Update all masks for next frame
+            for i, obj_id in enumerate(out_obj_ids):
+                if obj_id == 1:
+                    last_masks_rails[obj_id] = utility.refine_mask((out_mask_logits[i] > 0).cpu().numpy(),last_masks_rails[obj_id])
+                else:
+                    last_masks_rails[obj_id] = (out_mask_logits[i] > 0).cpu().numpy()
+
+            # Check for new objects periodically
+            if (frame_idx % 15 == 0 and frame_idx > 0):
+                # DETECTION OF THE GROUND
+                dino_boxes, phrases, dino_scores = utility.grounding_Dino_analyzer(
+                    frame_path, groundingdino, GROUND_PROMPT, device, BOX_TRESHOLD=BOX_TRESHOLD_GROUND,
+                    TEXT_TRESHOLD=TEXT_TRESHOLD_GROUND, show=False,
+                )
+
+                max_score_railway = 0
+                for i, box in enumerate(dino_boxes):
+                    if dino_scores[i] > max_score_railway:
+                        ground_box = [float(x) for x in box] #CHANGE FROM ground_box = box
+                        max_score_railway = dino_scores[i]
+
+                dino_boxes = []
+                phrases = []
+                for class_name in OBSTACLE_PROMPT:
+                    t_dino_boxes, t_phrases, _ = utility.grounding_Dino_analyzer(
+                        frame_path, groundingdino, class_name, device, BOX_TRESHOLD=BOX_TRESHOLD_OBSTACLES,
+                        TEXT_TRESHOLD=TEXT_TRESHOLD_OBSTACLES, show = False,
+                    )
+                    i=0
+                    for box in t_dino_boxes:
+                        if all(not np.array_equal(box, item) for item in dino_boxes):
+                            dino_boxes.append(box)
+                            phrases.append(t_phrases[i])
+                        i+=1
+
+                # Check each detected object
+                for obj_idx, phrase in enumerate(phrases):
+                    if phrases[obj_idx] != 'one train track':
+                        x_min, y_min, x_max, y_max = dino_boxes[obj_idx]
+                        center_x = (x_min + x_max) // 2
+                        center_y = (y_min + y_max) // 2
+
+                        # Check if this object is already tracked
+                        already_tracked = False
+                        for mask in last_masks_rails.values():
+                            mask = np.array(mask, dtype=np.uint8)
+                            mask = mask.squeeze()
+                            if mask[int(center_y), int(center_x)] > 0:
+                                already_tracked = True
+                                break
+
+                        #IF GROUND WAS NOT RECOGNISED, ASSUME TRACK IN THE TWO LOWER THIRDS OF THE IMAGE
+                        safe_ground_box = ground_box if ground_box is not None else [0, height // 2, width, height] #CHANGE
+                        # Add new object if not already tracked and is inside the railway area
+                        if (not already_tracked) and utility.is_point_inside_box([center_x, center_y], safe_ground_box): #CHANGE FROM ground_box
+                            ann_id += 1
+                            print(f"New object {ann_id} detected at frame {frame_idx}")
+
+                            _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+                                inference_state=inference_state_rails,
+                                frame_idx=0,
+                                obj_id=ann_id,
+                                points=[[center_x, center_y]],
+                                labels=np.array([1], np.int32),
+                            )
+
+                            # Convert out_obj_ids to numpy for indexing
+                            if hasattr(out_obj_ids, "cpu"):
+                                out_obj_ids_np = out_obj_ids.cpu().numpy()
+                            else:
+                                out_obj_ids_np = np.array(out_obj_ids)
+
+                            # Find index of the newly added object within out_obj_ids
+                            matches = np.where(out_obj_ids_np == ann_id)[0]
+                            if len(matches) == 0:
+                                # Newly added object not present in outputs; clean up and skip
+                                video_predictor.remove_object(inference_state_rails, ann_id)
+                                continue
+
+                            new_idx = int(matches[0])
+
+                            # Get new object's mask logits and convert to numpy
+                            new_mask_logits = out_mask_logits[new_idx]
+                            if hasattr(new_mask_logits, "cpu"):
+                                new_mask_np = (new_mask_logits > 0).cpu().numpy()
+                            else:
+                                new_mask_np = np.array(new_mask_logits > 0)
+
+                            # If not considered an obstacle, remove and skip
+                            if not utility.is_mask_an_obstacle(new_mask_np, last_masks_rails[1], ground_box):
+                                video_predictor.remove_object(inference_state_rails, ann_id)
+                                continue
+
+                            last_masks_rails[ann_id] = new_mask_np #CHANGE FROM:
+                            # Re-propagate with the new object
+                            '''result_rails = next(video_predictor.propagate_in_video(
+                                inference_state_rails,
+                                start_frame_idx=0
+                            ))
+                            _, out_obj_ids, out_mask_logits = result_rails'''
+
+                            # Update masks dictionary
+                            for j, obj_id in enumerate(out_obj_ids):
+                                if obj_id == 1:
+                                    last_masks_rails[obj_id] = utility.refine_mask((out_mask_logits[j] > 0).cpu().numpy(),
+                                                                                  last_masks_rails[obj_id])
+                                else:
+                                    last_masks_rails[obj_id] = (out_mask_logits[j] > 0).cpu().numpy()
+
+            #Removal of tracked masks that probably are not obstacles, but the same railway or other geometries in the image
+            idx_to_pop = []
+
+            for obj_id, mask in list(last_masks_rails.items()): #CHANGE FROM for obj_id, mask in last_masks_rails.items():
+                if mask is not None:
+                    if  obj_id!=1 and ((not utility.is_mask_an_obstacle(mask, last_masks_rails[1], ground_box)) or utility.is_mask_duplicate(mask, obj_id, last_masks_rails)):
+                        video_predictor.remove_object(inference_state_rails, obj_id)
+                        del last_masks_rails[obj_id] #CHANGE FROM last_masks_rails[obj_id] = np.zeros((height, width), dtype=np.uint8)
+
+            obj_id = 0
+            last_masks_rails_to_show = {}
+            #DETECT FIRST FRAME OF ANOMALIES
+            has_anomaly = False #CHANGE
+
+            for obj_id, mask in list(last_masks_rails.items()): #CHANGE FROM for obj_id, mask in last_masks_rails.items():
+                    if obj_id != 1 and mask is not None and np.sum(mask) > 0: #CHANGE
+                        has_anomaly = True #CHANGE
+                        break #CHANGE
+
+            if has_anomaly and not selected_anomalies: #CHANGE
+                print(f"[ANOMALY] First appearance at frame {frame_idx}") #CHANGE
+                suspect_frames.append(frame_idx) #CHANGE
+
+            selected_anomalies = has_anomaly #CHANGE
+
+            i=2
+            for obj_id, mask in list(last_masks_rails.items()): #CHANGE FROM for obj_id, mask in last_masks_rails.items():
+                if mask.sum() > 0:
+                    if obj_id == 1:
+                        last_masks_rails_to_show[1] = mask
+                    else:
+                        last_masks_rails_to_show[i] = mask
+                        i+=1
+
+            # Create visualization : CHANGE = DISABILITATED TO LIGHTEN THE MODEL 
+            '''plt.figure(figsize=(8, 6))
+            plt.imshow(frame_rgb)
+            rail_mask = None
+            if True:  # accuracy_test
+                os.makedirs(temp_main_railway_dir, exist_ok=True)
+                os.makedirs(temp_safe_obstacles_dir, exist_ok=True)
+                os.makedirs(temp_dangerous_obstacles_dir, exist_ok=True)
+            for obj_id, mask in last_masks_rails_to_show.items():
+                if obj_id != 1 and obj_id != 0:
+                    utility.show_anomalies(mask,plt.gca(),rail_mask, True , obj_id,frame_idx) #FIXME al posto di True ci devo mettere args.accuracy_test
+                else:
+                    utility.show_mask_v(mask, plt.gca(), True, frame_idx, obj_id=obj_id)#FIXME al posto di True ci devo mettere args.accuracy_test
+                    rail_mask = mask
+            if False:  #CHANGE FROM true # show the plt image using OpenCV     args.show_frames
+                cv2.imshow("Processed video frame", utility.plt_figure_to_cv2( plt.gcf()))
+                key = cv2.waitKey(1)
+                if key == ord('q'):
+                    raise KeyboardInterrupt
+            if False:  #to remove True in args.save_frames
+                plt.savefig(os.path.join(args.output_path, f"frame_{frame_idx:06d}.jpg"))
+
+            plt.close()'''
+
+            # Calculate processing time
+            processing_time = time.time() - start_time
+            print(f"Frame processed in {processing_time:.2f}s", flush=True)
+
+            # Increment frame counter
+            frame_idx += 1
+            
+            # Clear memory for next iteration
+            video_predictor.reset_state(inference_state_rails) #CHANGE
+            del inference_state_rails
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    except (KeyboardInterrupt, SystemExit):
+        print("Exiting gracefully...")
+    finally:
+
+        #CHANGE FROM if False: #CHANGE FROM True TO DISABILITATE THE SEARCH FOR IMAGES#FIXME al posto di True ci devo mettere args.accuracy_test
+            #CHANGE utility.calculate_accuracy(frame_idx,temp_main_railway_dir, temp_safe_obstacles_dir, temp_dangerous_obstacles_dir)
+        # Release resources
+        if 'cap' in locals() and cap.isOpened(): #CHANGE
+            cap.release()
+
+        # Clean up temp directory
+        if os.path.exists(temp_dir): #CHANGE
+            for file in os.listdir(temp_dir):
+                os.remove(os.path.join(temp_dir, file))
+            os.rmdir(temp_dir)
+            
+        if os.path.exists(temp_main_railway_dir): #CHANGE
+            for file in os.listdir(temp_main_railway_dir):
+                os.remove(os.path.join(temp_main_railway_dir, file))
+            os.rmdir(temp_main_railway_dir)
+            
+        if os.path.exists(temp_safe_obstacles_dir): #CHANGE
+            for file in os.listdir(temp_safe_obstacles_dir):
+                os.remove(os.path.join(temp_safe_obstacles_dir, file))
+            os.rmdir(temp_safe_obstacles_dir)
+
+        if os.path.exists(temp_dangerous_obstacles_dir): #CHANGE
+            for file in os.listdir(temp_dangerous_obstacles_dir):
+                os.remove(os.path.join(temp_dangerous_obstacles_dir, file))
+            os.rmdir(temp_dangerous_obstacles_dir)
+
+        if args.show_frames:
+            cv2.destroyAllWindows()
+
+        #SAVE ANOMALY FRAMES
+        with open("found_anomalies.txt", "w") as f: #CHANGE
+            for idx in suspect_frames: #CHANGE
+                f.write(f"{idx}\n") #CHANGE
+        print(f"Saved {len(suspect_frames)} anomaly frames to found_anomalies.txt") #CHANGE
+
+        print(f"Processing completed or interrupted after {frame_idx} frames")
+
+if __name__ == "__main__":
+    main()
+
